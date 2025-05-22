@@ -1,46 +1,86 @@
 import os
-from telethon import TelegramClient, events
-from dotenv import load_dotenv
+import asyncio
+from telethon import TelegramClient, events, errors
+from aiohttp import web
 
-load_dotenv()
+API_ID = int(os.getenv('API_ID'))
+API_HASH = os.getenv('API_HASH')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# TelegramClient session string or session name
+SESSION_NAME = 'bot_session'
 
-client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# Create client for bot using Telethon
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-@client.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
-    await event.respond("Hi, what's up? Send me a Telegram username (with or without @) to fetch their DPs.")
+# We will keep track of users waiting to send username
+waiting_for_username = set()
+
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    sender = await event.get_sender()
+    user_id = sender.id
+    await event.reply("Hi! Send me a Telegram username (with or without @), and I'll fetch all profile photos of that user.")
+    waiting_for_username.add(user_id)
 
 @client.on(events.NewMessage)
-async def username_handler(event):
-    text = event.raw_text.strip()
-    if text.startswith("/"):
-        return
+async def handle_username(event):
+    sender = await event.get_sender()
+    user_id = sender.id
+    if user_id not in waiting_for_username:
+        return  # Ignore messages if not expecting username
 
-    username = text.replace("@", "")
+    username = event.raw_text.strip()
+    if username.startswith('@'):
+        username = username[1:]
+
+    waiting_for_username.remove(user_id)  # We got username, remove from waiting
 
     try:
-        user = await client.get_entity(username)
-        photos = await client.get_profile_photos(user)
+        # Get the entity (user) from username
+        entity = await client.get_entity(username)
+    except (ValueError, errors.UsernameNotOccupiedError):
+        await event.reply("❌ Invalid username or user not found. Please try /start again with a valid username.")
+        return
+    except Exception as e:
+        await event.reply(f"❌ Error: {str(e)}")
+        return
 
+    try:
+        photos = await client.get_profile_photos(entity)
         if not photos:
-            await event.respond(f"No public profile photos found for @{username}.")
+            await event.reply("This user has no profile photos.")
             return
 
-        count = 0
+        await event.reply(f"Found {len(photos)} profile photos. Sending now...")
+        # Send photos one by one
         for photo in photos:
-            file_path = await client.download_media(photo, file=f"temp_{count}.jpg")
-            await client.send_file(event.chat_id, file_path)
-            os.remove(file_path)
-            count += 1
-
-        await event.respond(f"Sent {count} profile photos of @{username}.")
-
+            await client.send_file(event.chat_id, photo)
     except Exception as e:
-        await event.respond(f"Sorry, couldn't fetch photos. Error: {str(e)}")
+        await event.reply(f"❌ Failed to fetch/send photos: {str(e)}")
 
-print("Bot is running...")
-client.run_until_disconnected()
+# aiohttp web server for Render
+async def handle(request):
+    return web.Response(text="Bot is running")
+
+app = web.Application()
+app.add_routes([web.get('/', handle)])
+
+async def main():
+    # Start the Telegram client
+    await client.start()
+    print("Telegram Bot started!")
+
+    # Run both Telegram client and web server concurrently
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
+    # Run Telegram client until disconnected
+    await client.run_until_disconnected()
+
+if __name__ == '__main__':
+    asyncio.run(main())
